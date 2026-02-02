@@ -58,7 +58,7 @@ def save_to_csv(results: dict, output_path: Path) -> None:
 
 
 def main():
-    # Query Italian Chamber of Deputies for approved acts from 19th Legislature
+    # Query Italian Chamber of Deputies for approved acts from 19th Legislature (Nov 2025)
     endpoint = "http://dati.camera.it/sparql"
 
     query = """
@@ -75,6 +75,7 @@ def main():
             dc:title ?titolo; ocd:rif_statoIter ?statoIter .
         ?statoIter  dc:title ?fase ; dc:date ?dataIter .
         FILTER(CONTAINS(LCASE(?fase), "approvato"))
+        FILTER(REGEX(?dataIter, "^202511"))
         OPTIONAL{
             ?votazione a ocd:votazione; ocd:rif_attoCamera ?atto;
                 ocd:approvato "1"^^xsd:integer;
@@ -96,7 +97,7 @@ def main():
 
     # Generate filename with timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = output_dir / f"legislatura_19_approved_{timestamp}.csv"
+    output_file = output_dir / f"legislatura_19_approved_nov2025_{timestamp}.csv"
 
     # Save results to CSV
     save_to_csv(results, output_file)
