@@ -74,10 +74,12 @@ def main():
             dc:date ?presentazione;
             dc:title ?titolo; ocd:rif_statoIter ?statoIter .
         ?statoIter  dc:title ?fase ; dc:date ?dataIter .
-        ?votazione a ocd:votazione; ocd:rif_attoCamera ?atto;
-            ocd:approvato "1"^^xsd:integer;
-            ocd:votazioneFinale "1"^^xsd:integer;
-            dc:date ?dataApprovazione.
+        FILTER(CONTAINS(LCASE(?fase), "approvato"))
+        OPTIONAL{
+            ?votazione a ocd:votazione; ocd:rif_attoCamera ?atto;
+                ocd:approvato "1"^^xsd:integer;
+                dc:date ?dataApprovazione.
+        }
     } ORDER BY ?presentazione ?dataIter
     """
 
