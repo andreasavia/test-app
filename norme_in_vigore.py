@@ -10,6 +10,28 @@ from datetime import datetime
 BASE_URL = "https://api.normattiva.it/t/normattiva.api/bff-opendata/v1/api/v1"
 HEADERS = {"Content-Type": "application/json"}
 
+# denominazioneAtto  →  segmento URN di normattiva.it
+URN_TIPO = {
+    "LEGGE":                                        "legge",
+    "DECRETO-LEGGE":                                "decreto-legge",
+    "DECRETO LEGISLATIVO":                          "decreto-legislativo",
+    "DECRETO DEL PRESIDENTE DELLA REPUBBLICA":      "decreto:presidente:repubblica",
+    "DECRETO DEL PRESIDENTE DEL CONSIGLIO DEI MINISTRI": "decreto:presidente:consiglio-dei-ministri",
+    "DECRETO":                                      "decreto",
+}
+
+
+def normattiva_uri(atto: dict) -> str:
+    """Build the normattiva.it N2Ls URI for an atto, or empty string if type unknown."""
+    tipo = URN_TIPO.get(atto.get("denominazioneAtto", ""))
+    if not tipo:
+        return ""
+    data = atto.get("dataEmanazione", "")[:10]   # "2025-10-03T…" → "2025-10-03"
+    numero = atto.get("numeroProvvedimento", "")
+    if not data or not numero:
+        return ""
+    return f"https://www.normattiva.it/uri-res/N2Ls?urn:nir:stato:{tipo}:{data};{numero}"
+
 
 def ricerca_avanzata(anno: int, mese: int, pagina: int = 1, per_pagina: int = 100) -> dict:
     """Ricerca avanzata filtrata per anno e mese di emanazione."""
@@ -76,6 +98,10 @@ def main():
         print(f"  Pagina {pagina}: {len(batch)} risultati")
         pagina += 1
 
+    # Enrich each atto with the normattiva.it URI
+    for atto in atti:
+        atto["normattiva_uri"] = normattiva_uri(atto)
+
     # Save raw JSON (ultima risposta) e CSV completo
     save_to_json({"listaAtti": atti}, output_dir / f"norme_{anno}{mese:02d}_raw_{timestamp}.json")
     print(f"\n  Totale norme: {len(atti)}\n")
@@ -84,12 +110,13 @@ def main():
         save_to_csv(atti, output_dir / f"norme_{anno}{mese:02d}_{timestamp}.csv")
 
         print("\n  Prime 10 norme:")
-        print(f"  {'codice':<14} {'data GU':<12} {'descrizione'}")
-        print(f"  {'-'*14} {'-'*12} {'-'*50}")
+        print(f"  {'codice':<14} {'data GU':<12} {'descrizione':<45} {'normattiva_uri'}")
+        print(f"  {'-'*14} {'-'*12} {'-'*45} {'-'*70}")
         for atto in atti[:10]:
             print(f"  {atto.get('codiceRedazionale', ''):<14} "
                   f"{atto.get('dataGU', ''):<12} "
-                  f"{atto.get('descrizioneAtto', '')}")
+                  f"{atto.get('descrizioneAtto', ''):<45} "
+                  f"{atto.get('normattiva_uri', '')}")
 
     print("\n" + "=" * 60)
     print("Done!")
