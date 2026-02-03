@@ -11,15 +11,20 @@ BASE_URL = "https://api.normattiva.it/t/normattiva.api/bff-opendata/v1/api/v1"
 HEADERS = {"Content-Type": "application/json"}
 
 
-def get_norme_aggiornati(data_inizio: str, data_fine: str) -> dict:
-    """Fetch norms updated/in effect in the given date range via ricerca/aggiornati."""
-    url = f"{BASE_URL}/ricerca/aggiornati"
+def ricerca_avanzata(anno: int, mese: int, pagina: int = 1, per_pagina: int = 100) -> dict:
+    """Ricerca avanzata filtrata per anno e mese di emanazione."""
+    url = f"{BASE_URL}/ricerca/avanzata"
     payload = {
-        "dataInizioAggiornamento": data_inizio,
-        "dataFineAggiornamento": data_fine
+        "orderType": "vecchio",
+        "annoProvvedimento": anno,
+        "meseProvvedimento": mese,
+        "paginazione": {
+            "paginaCorrente": pagina,
+            "numeroElementiPerPagina": per_pagina
+        }
     }
 
-    print(f"Fetching norme aggiornati: {data_inizio} -> {data_fine}")
+    print(f"Ricerca avanzata: anno={anno}, mese={mese}, pagina={pagina}")
     response = requests.post(url, json=payload, headers=HEADERS, timeout=60)
     response.raise_for_status()
     return response.json()
@@ -48,29 +53,35 @@ def save_to_json(data: dict, output_path: Path) -> None:
 
 
 def main():
-    # Novembre 2025
-    data_inizio = "2025-11-01T00:00:00Z"
-    data_fine = "2025-11-30T23:59:59Z"
+    anno = 2025
+    mese = 11
 
     output_dir = Path("output/norme_in_vigore")
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     print("=" * 60)
-    print("Norme in vigore - Novembre 2025")
+    print(f"Norme emanate - {anno}/{mese:02d}")
     print("=" * 60 + "\n")
 
-    results = get_norme_aggiornati(data_inizio, data_fine)
+    # Pagina tutte le risultati
+    atti = []
+    pagina = 1
+    while True:
+        results = ricerca_avanzata(anno, mese, pagina=pagina)
+        batch = results.get("listaAtti", [])
+        if not batch:
+            break
+        atti.extend(batch)
+        print(f"  Pagina {pagina}: {len(batch)} risultati")
+        pagina += 1
 
-    # Save raw JSON
-    save_to_json(results, output_dir / f"norme_nov2025_raw_{timestamp}.json")
-
-    # Extract and save atti list
-    atti = results.get("listaAtti", [])
-    print(f"  Totale norme: {len(atti)}\n")
+    # Save raw JSON (ultima risposta) e CSV completo
+    save_to_json({"listaAtti": atti}, output_dir / f"norme_{anno}{mese:02d}_raw_{timestamp}.json")
+    print(f"\n  Totale norme: {len(atti)}\n")
 
     if atti:
-        save_to_csv(atti, output_dir / f"norme_nov2025_{timestamp}.csv")
+        save_to_csv(atti, output_dir / f"norme_{anno}{mese:02d}_{timestamp}.csv")
 
         print("\n  Prime 10 norme:")
         print(f"  {'codice':<14} {'data GU':<12} {'descrizione'}")
