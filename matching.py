@@ -306,25 +306,50 @@ def main():
         else:
             print(f"  ✗ no match")
 
-    # --- summary table ---
+    # --- full summary table (all norms in month, matched + skipped) ---
+    matched_by_codice = {r["codice"]: r for r in results}
+
     print("\n" + "=" * 70)
-    print("SUMMARY")
+    print("SUMMARY — ALL NORMS")
     print("=" * 70)
-    print(f"  {'Codice':<14} {'Titolo (Normattiva)':<50} {'Camera act':<12} {'Conf.'}")
-    print(f"  {'-'*14} {'-'*50} {'-'*12} {'-'*10}")
-    for r in results:
-        camera_act = r["matched"][0]["numero"] if r["matched"] else "—"
-        print(f"  {r['codice']:<14} {r['titolo'][:50]:<50} {camera_act:<12} {r['confidence']}")
+    print(f"  {'Codice':<14} {'Descrizione (Normattiva)':<52} {'Camera act':<12} {'Status'}")
+    print(f"  {'-'*14} {'-'*52} {'-'*12} {'-'*12}")
+
+    full_table = []
+    for a in month_norms:
+        codice = a.get("codiceRedazionale", "")
+        desc   = a.get("descrizioneAtto", "")
+        norm_type = classify_norm_type(desc)
+        r = matched_by_codice.get(codice)
+
+        if r:
+            camera_act = r["matched"][0]["numero"] if r["matched"] else "—"
+            status     = r["confidence"]
+        else:
+            camera_act = "—"
+            status     = "skipped"
+
+        print(f"  {codice:<14} {desc[:52]:<52} {camera_act:<12} {status}")
+        full_table.append({
+            "codice": codice,
+            "dataGU": a.get("dataGU", ""),
+            "descrizione": desc,
+            "norm_type": norm_type,
+            "camera_act": camera_act if camera_act != "—" else None,
+            "confidence": status,
+            "match_detail": r,
+        })
 
     exact   = sum(1 for r in results if r["confidence"] == "exact")
     ambig   = sum(1 for r in results if r["confidence"] == "ambiguous")
     nomatch = sum(1 for r in results if r["confidence"] == "no_match")
-    print(f"\n  exact: {exact}   ambiguous: {ambig}   no_match: {nomatch}")
+    skipped = len(month_norms) - len(results)
+    print(f"\n  exact: {exact}   ambiguous: {ambig}   no_match: {nomatch}   skipped: {skipped}")
 
     # --- save ---
     month_tag = month_prefix.replace("-", "")
     out_file = output_dir / f"batch_matching_{month_tag}.json"
-    out_file.write_text(json.dumps(results, indent=2, ensure_ascii=False))
+    out_file.write_text(json.dumps(full_table, indent=2, ensure_ascii=False))
     print(f"\n  ✓ Saved: {out_file}")
     print("=" * 70)
 
