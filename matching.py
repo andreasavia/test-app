@@ -13,7 +13,7 @@ Strategy A — decreto-legge reference (applies to conversion laws):
 
 Strategy B — approval date:
   Extract law date from Normattiva titolo (e.g. "18 novembre 2025" -> 20251118).
-  Query Camera for acts reaching fase containing "legge" on that date.
+  Query Camera for acts with any statoIter on that date.
 
 Confidence levels:
   exact      — A ∩ B yields exactly one unique act  (or single strategy yields one)
@@ -98,7 +98,6 @@ def camera_search_by_dl_ref(dl_numero: str) -> list:
             ?statoIter dc:title ?fase ; dc:date ?dataIter .
             FILTER(CONTAINS(LCASE(?titolo), "decreto-legge"))
             FILTER(CONTAINS(?titolo, "n. {dl_numero}"))
-            FILTER(CONTAINS(LCASE(?fase), "legge"))
         }} ORDER BY ?dataIter
     ''')
     sparql.setReturnFormat(JSON)
@@ -107,7 +106,7 @@ def camera_search_by_dl_ref(dl_numero: str) -> list:
 
 
 def camera_search_by_date(date_str: str) -> list:
-    """Strategy B: search Camera for acts reaching fase 'Legge' on a given date."""
+    """Strategy B: search Camera for acts with any statoIter on a given date."""
     sparql = SPARQLWrapper(CAMERA_SPARQL)
     sparql.setQuery(f'''
         PREFIX ocd: <http://dati.camera.it/ocd/>
@@ -120,7 +119,6 @@ def camera_search_by_date(date_str: str) -> list:
                 dc:title ?titolo;
                 ocd:rif_statoIter ?statoIter .
             ?statoIter dc:title ?fase ; dc:date ?dataIter .
-            FILTER(CONTAINS(LCASE(?fase), "legge"))
             FILTER(?dataIter = "{date_str}")
         }} ORDER BY ?numero
     ''')

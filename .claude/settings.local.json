@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Bash(source:*)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(python3:*)",
+      "Bash(printf:*)"
     ]
   }
 }
