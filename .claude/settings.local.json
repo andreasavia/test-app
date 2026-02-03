@@ -8,7 +8,8 @@
       "Bash(ls:*)",
       "Bash(pip3 list:*)",
       "Bash(curl:*)",
-      "Bash(brew upgrade:*)"
+      "Bash(brew upgrade:*)",
+      "Bash(tree:*)"
     ]
   }
 }
