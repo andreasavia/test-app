@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Normattiva - Norme in vigore in un periodo specificato."""
 
+import argparse
 import csv
 import json
 import requests
@@ -75,8 +76,11 @@ def save_to_json(data: dict, output_path: Path) -> None:
 
 
 def main():
-    anno = 2025
-    mese = 10
+    parser = argparse.ArgumentParser(description="Normattiva – norme emanate in un periodo")
+    parser.add_argument("anno", type=int, help="Anno (es. 2025)")
+    parser.add_argument("mese", type=int, help="Mese (1-12)")
+    args = parser.parse_args()
+    anno, mese = args.anno, args.mese
 
     output_dir = Path("output/norme_in_vigore")
     output_dir.mkdir(parents=True, exist_ok=True)
