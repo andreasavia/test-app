@@ -1,19 +1,32 @@
 #!/usr/bin/env python3
 """
-Match Normattiva laws back to Camera dei Deputati acts.
+Batch matching: Normattiva laws -> Camera dei Deputati acts.
 
-Two matching strategies identified:
+Reads the norm list produced by norme_in_vigore.py, filters to LEGGEs
+(ordinary laws that always pass through Camera), then for each norm runs
+two matching strategies, computes their intersection, and refines any
+remaining ambiguities via keyword overlap against the Camera titolo.
 
-Strategy A — decreto-legge reference (most reliable):
-  Normattiva sottoTitolo contains e.g. "decreto-legge 3 ottobre 2025, n. 145"
-  Camera titolo contains the same reference.
-  -> extract the DL number+date from Normattiva, FILTER Camera titolo by it.
+Strategy A — decreto-legge reference (applies to conversion laws):
+  Extract "decreto-legge <date>, n. <numero>" from Normattiva sottoTitolo.
+  FILTER Camera titolo by that DL numero.
 
 Strategy B — approval date:
-  Normattiva law date (e.g. "18 novembre 2025") = Camera fase "Legge" dataIter (20251118)
-  -> query Camera for fase containing "Legge" on that date.
+  Extract law date from Normattiva titolo (e.g. "18 novembre 2025" -> 20251118).
+  Query Camera for acts reaching fase containing "legge" on that date.
+
+Confidence levels:
+  exact      — A ∩ B yields exactly one unique act  (or single strategy yields one)
+  ambiguous  — intersection has > 1 candidate
+  no_match   — no candidate found
+
+Usage:
+    python matching.py                        # batch over Nov 2025 (default input)
+    python matching.py --input <path.json>    # custom norms JSON
 """
 
+import argparse
+import html
 import json
 import re
 import requests
@@ -23,6 +36,10 @@ from SPARQLWrapper import SPARQLWrapper, JSON
 NORMATTIVA_BASE = "https://api.normattiva.it/t/normattiva.api/bff-opendata/v1/api/v1"
 CAMERA_SPARQL = "http://dati.camera.it/sparql"
 HEADERS = {"Content-Type": "application/json"}
+
+# Only ordinary LEGGEs always originate as Camera acts.
+# D.Lgs are government decrees (based on a prior legge delega) — skip them.
+CAMERA_TYPES = {"LEGGE"}
 
 
 def get_normattiva_detail(codice_redazionale: str, data_gu: str) -> dict:
@@ -50,7 +67,7 @@ def extract_decreto_legge_ref(text: str) -> dict | None:
 
 
 def extract_law_date(titolo: str) -> str | None:
-    """Extract YYYYMMDD from Normattiva titolo like 'LEGGE 18 novembre 2025, n. 173'.
+    """Extract YYYYMMDD from titolo like 'LEGGE 18 novembre 2025, n. 173'.
 
     Returns Camera-style date string e.g. '20251118'.
     """
@@ -114,71 +131,166 @@ def camera_search_by_date(date_str: str) -> list:
     return results["results"]["bindings"]
 
 
-def main():
-    output_dir = Path("output/matching")
-    output_dir.mkdir(parents=True, exist_ok=True)
+def flatten_hits(hits: list) -> list[dict]:
+    """Flatten SPARQL bindings to plain dicts and deduplicate by atto URI."""
+    seen = set()
+    result = []
+    for h in hits:
+        uri = h["atto"]["value"]
+        if uri not in seen:
+            seen.add(uri)
+            result.append({k: v["value"] for k, v in h.items()})
+    return result
 
-    # Target: Legge 18 novembre 2025, n. 173 (conversione DL 145/2025)
-    codice = "25G00182"
-    data_gu = "2025-11-20"
 
-    print("=" * 70)
-    print("MATCHING: Normattiva -> Camera dei Deputati")
-    print(f"Target: codiceRedazionale={codice}, dataGU={data_gu}")
-    print("=" * 70 + "\n")
+def intersect(hits_a: list[dict], hits_b: list[dict]) -> list[dict]:
+    """Return acts present in both hit lists (by atto URI)."""
+    uris_b = {h["atto"] for h in hits_b}
+    return [h for h in hits_a if h["atto"] in uris_b]
 
-    # 1. Fetch Normattiva detail
-    print("--- 1. Normattiva detail ---")
+
+def _significant_words(text: str) -> set[str]:
+    """Decode HTML, collapse whitespace, return words >= 4 chars (stop-word proxy)."""
+    return set(re.findall(r'\b\w{4,}\b', re.sub(r'\s+', ' ', html.unescape(text)).lower()))
+
+
+def refine_by_keywords(sotto_titolo: str, candidates: list[dict]) -> list[dict]:
+    """When multiple candidates survive A∩B, pick those with best keyword overlap.
+
+    Compares significant words in Normattiva sottoTitolo against each Camera titolo.
+    Returns only the candidate(s) tied at the highest score.
+    """
+    if len(candidates) <= 1:
+        return candidates
+    norm_words = _significant_words(sotto_titolo)
+    scored = [(c, len(norm_words & _significant_words(c["titolo"]))) for c in candidates]
+    max_score = max(s for _, s in scored)
+    return [c for c, s in scored if s == max_score]
+
+
+def match_norm(codice: str, data_gu: str) -> dict:
+    """Full matching pipeline for a single norm."""
     detail = get_normattiva_detail(codice, data_gu)
     atto = detail.get("data", {}).get("atto", {})
     titolo = atto.get("titolo", "")
     sotto_titolo = atto.get("sottoTitolo", "").strip()
-    print(f"  titolo:      {titolo}")
-    print(f"  sottoTitolo: {sotto_titolo}\n")
 
-    # 2. Extract references
-    print("--- 2. Extract references ---")
     dl_ref = extract_decreto_legge_ref(sotto_titolo)
     law_date = extract_law_date(titolo)
-    print(f"  decreto-legge ref: {dl_ref}")
-    print(f"  law date (Camera format): {law_date}\n")
 
-    # 3. Strategy A — match by decreto-legge number
-    print("--- 3. Strategy A: match by decreto-legge numero ---")
-    if dl_ref:
-        hits_a = camera_search_by_dl_ref(dl_ref["numero"])
-        for h in hits_a:
-            vals = {k: v["value"] for k, v in h.items()}
-            print(f"  ac19_{vals['numero']:<6} fase: {vals['fase']:<60} dataIter: {vals['dataIter']}")
+    hits_a = flatten_hits(camera_search_by_dl_ref(dl_ref["numero"])) if dl_ref else []
+    hits_b = flatten_hits(camera_search_by_date(law_date)) if law_date else []
+
+    # Intersection if both strategies fired; otherwise fall back to whichever ran
+    if hits_a and hits_b:
+        matched = intersect(hits_a, hits_b)
+    elif hits_a:
+        matched = hits_a
     else:
-        print("  No decreto-legge ref found.")
-        hits_a = []
+        matched = hits_b
 
-    # 4. Strategy B — match by date
-    print(f"\n--- 4. Strategy B: match by date {law_date} ---")
-    if law_date:
-        hits_b = camera_search_by_date(law_date)
-        for h in hits_b:
-            vals = {k: v["value"] for k, v in h.items()}
-            print(f"  ac19_{vals['numero']:<6} fase: {vals['fase']:<60} dataIter: {vals['dataIter']}")
+    # Keyword refinement: disambiguate same-date candidates via title overlap
+    if len(matched) > 1:
+        matched = refine_by_keywords(sotto_titolo, matched)
+
+    if len(matched) == 1:
+        confidence = "exact"
+    elif len(matched) > 1:
+        confidence = "ambiguous"
     else:
-        print("  Could not extract law date.")
-        hits_b = []
+        confidence = "no_match"
 
-    # 5. Save all results
-    output = {
-        "normattiva": {"codice": codice, "dataGU": data_gu, "titolo": titolo, "sottoTitolo": sotto_titolo},
-        "extracted": {"decreto_legge_ref": dl_ref, "law_date": law_date},
-        "strategy_a_results": [{k: v["value"] for k, v in h.items()} for h in hits_a],
-        "strategy_b_results": [{k: v["value"] for k, v in h.items()} for h in hits_b],
+    return {
+        "codice": codice,
+        "dataGU": data_gu,
+        "titolo": titolo,
+        "dl_ref": dl_ref,
+        "law_date": law_date,
+        "strategy_a": hits_a,
+        "strategy_b": hits_b,
+        "matched": matched,
+        "confidence": confidence,
     }
-    out_file = output_dir / "matching_25G00182.json"
-    with out_file.open("w", encoding="utf-8") as f:
-        json.dump(output, f, indent=2, ensure_ascii=False)
-    print(f"\n  ✓ Saved: {out_file}")
 
+
+def classify_norm_type(descrizione: str) -> str:
+    """Classify norm into a coarse type bucket."""
+    for t in ("LEGGE", "DECRETO LEGISLATIVO", "DECRETO-LEGGE",
+              "DECRETO DEL PRESIDENTE DELLA REPUBBLICA",
+              "DECRETO DEL PRESIDENTE DEL CONSIGLIO DEI MINISTRI", "DECRETO"):
+        if descrizione.startswith(t):
+            return t
+    return "ALTRO"
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Batch match Normattiva -> Camera")
+    parser.add_argument("--input", type=Path,
+                        default=Path("output/norme_in_vigore/norme_202511_raw_20260202_160857.json"),
+                        help="Path to norme_in_vigore raw JSON")
+    parser.add_argument("--month", type=str, default="2025-11",
+                        help="Filter dataGU prefix (default: 2025-11)")
+    args = parser.parse_args()
+
+    norms_data = json.loads(args.input.read_text())
+    all_norms = norms_data["listaAtti"]
+
+    # Filter to the target month and Camera-eligible types
+    targets = [
+        a for a in all_norms
+        if a.get("dataGU", "").startswith(args.month)
+        and classify_norm_type(a.get("descrizioneAtto", "")) in CAMERA_TYPES
+    ]
+    targets.sort(key=lambda a: a.get("dataGU", ""))
+
+    output_dir = Path("output/matching")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 70)
+    print(f"BATCH MATCHING: Normattiva -> Camera dei Deputati  [{args.month}]")
+    print(f"Input: {args.input.name}  |  Eligible norms: {len(targets)}")
+    print("=" * 70)
+
+    results = []
+    for i, norm in enumerate(targets):
+        codice = norm["codiceRedazionale"]
+        data_gu = norm["dataGU"]
+        desc = norm.get("descrizioneAtto", "")
+        print(f"\n[{i+1}/{len(targets)}] {codice}  {data_gu}  {desc}")
+
+        result = match_norm(codice, data_gu)
+        results.append(result)
+
+        if result["confidence"] == "exact":
+            act = result["matched"][0]
+            print(f"  ✓ {act['numero']:<6} — {act['titolo'].strip()[:80]}")
+        elif result["confidence"] == "ambiguous":
+            print(f"  ~ AMBIGUOUS ({len(result['matched'])} candidates)")
+            for m in result["matched"]:
+                print(f"    {m['numero']:<6} — {m['titolo'].strip()[:70]}")
+        else:
+            print(f"  ✗ no match")
+
+    # --- summary table ---
     print("\n" + "=" * 70)
-    print("Done!")
+    print("SUMMARY")
+    print("=" * 70)
+    print(f"  {'Codice':<14} {'Titolo (Normattiva)':<50} {'Camera act':<12} {'Conf.'}")
+    print(f"  {'-'*14} {'-'*50} {'-'*12} {'-'*10}")
+    for r in results:
+        camera_act = r["matched"][0]["numero"] if r["matched"] else "—"
+        print(f"  {r['codice']:<14} {r['titolo'][:50]:<50} {camera_act:<12} {r['confidence']}")
+
+    exact   = sum(1 for r in results if r["confidence"] == "exact")
+    ambig   = sum(1 for r in results if r["confidence"] == "ambiguous")
+    nomatch = sum(1 for r in results if r["confidence"] == "no_match")
+    print(f"\n  exact: {exact}   ambiguous: {ambig}   no_match: {nomatch}")
+
+    # --- save ---
+    month_tag = args.month.replace("-", "")
+    out_file = output_dir / f"batch_matching_{month_tag}.json"
+    out_file.write_text(json.dumps(results, indent=2, ensure_ascii=False))
+    print(f"\n  ✓ Saved: {out_file}")
     print("=" * 70)
 
 
