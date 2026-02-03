@@ -4,7 +4,10 @@
       "Bash(source:*)",
       "Bash(python:*)",
       "Bash(python3:*)",
-      "Bash(printf:*)"
+      "Bash(printf:*)",
+      "Bash(ls:*)",
+      "Bash(pip3 list:*)",
+      "Bash(curl:*)"
     ]
   }
 }

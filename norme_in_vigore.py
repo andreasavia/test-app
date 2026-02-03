@@ -54,7 +54,7 @@ def save_to_json(data: dict, output_path: Path) -> None:
 
 def main():
     anno = 2025
-    mese = 12
+    mese = 10
 
     output_dir = Path("output/norme_in_vigore")
     output_dir.mkdir(parents=True, exist_ok=True)
