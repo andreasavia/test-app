@@ -254,22 +254,36 @@ def main():
 
     print(f"\n  Fetching norms from Normattiva for {anno}/{mese:02d}...")
     all_norms = fetch_norms(anno, mese)
-    print(f"  Normattiva returned {len(all_norms)} norms total")
 
-    # Filter to LEGGEs published in the requested month
-    targets = [
-        a for a in all_norms
-        if a.get("dataGU", "").startswith(month_prefix)
-        and classify_norm_type(a.get("descrizioneAtto", "")) in CAMERA_TYPES
-    ]
-    targets.sort(key=lambda a: a.get("dataGU", ""))
+    # All norms published in the requested month (dataGU prefix)
+    month_norms = sorted(
+        [a for a in all_norms if a.get("dataGU", "").startswith(month_prefix)],
+        key=lambda a: a.get("dataGU", "")
+    )
+
+    # --- print full norm listing ---
+    print("\n" + "=" * 70)
+    print(f"NORMS PUBLISHED IN {month_prefix}  ({len(month_norms)} total)")
+    print("=" * 70)
+    print(f"  {'#':<4} {'Codice':<14} {'dataGU':<12} {'Type':<8} {'Descrizione'}")
+    print(f"  {'-'*4} {'-'*14} {'-'*12} {'-'*8} {'-'*50}")
+    for idx, a in enumerate(month_norms, 1):
+        norm_type = classify_norm_type(a.get("descrizioneAtto", ""))
+        marker = "→" if norm_type in CAMERA_TYPES else " "
+        codice = a.get("codiceRedazionale", "")
+        dgu    = a.get("dataGU", "")
+        desc   = a.get("descrizioneAtto", "")
+        print(f"  {marker}{idx:<3} {codice:<14} {dgu:<12} {norm_type:<8} {desc}")
+
+    # Filter to LEGGEs for matching
+    targets = [a for a in month_norms if classify_norm_type(a.get("descrizioneAtto", "")) in CAMERA_TYPES]
 
     output_dir = Path("output/matching")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("\n" + "=" * 70)
     print(f"BATCH MATCHING: Normattiva -> Camera dei Deputati  [{month_prefix}]")
-    print(f"LEGGEs to match: {len(targets)}")
+    print(f"LEGGEs to match: {len(targets)}  (→ = will be matched)")
     print("=" * 70)
 
     results = []
