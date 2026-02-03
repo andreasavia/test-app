@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """SPARQL Query Script - Run SPARQL queries against endpoints."""
 
+import argparse
 import csv
 import re
 import requests
@@ -10,6 +11,9 @@ from SPARQLWrapper import SPARQLWrapper, JSON
 
 NORMATTIVA_LINK_RE = re.compile(
     r'http://www\.normattiva\.it/uri-res/N2Ls\?urn:nir:stato:[^"\'<>\s]+'
+)
+SENATO_LINK_RE = re.compile(
+    r'https?://www\.senato\.it/uri-res/N2Ls\?urn:senato-it:[^"\'<>\s]+'
 )
 
 
@@ -63,50 +67,63 @@ def save_to_csv(results: dict, output_path: Path) -> None:
     print(f"\nResults saved to: {output_path}")
 
 
-def fetch_normattiva_links(url: str) -> list[str]:
-    """Fetch a camera.it page and extract all normattiva.it N2Ls URIs."""
+def fetch_page_links(url: str) -> tuple[list[str], list[str]]:
+    """Fetch a camera.it page and extract normattiva.it and senato.it N2Ls URIs."""
     headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_0) AppleWebKit/537.36"}
     try:
         r = requests.get(url, headers=headers, timeout=30)
         r.raise_for_status()
-        return list(dict.fromkeys(NORMATTIVA_LINK_RE.findall(r.text)))  # unique, order-preserved
+        normattiva = list(dict.fromkeys(NORMATTIVA_LINK_RE.findall(r.text)))
+        senato     = list(dict.fromkeys(SENATO_LINK_RE.findall(r.text)))
+        return normattiva, senato
     except Exception as e:
         print(f"[warn] {e}")
-        return []
+        return [], []
 
 
 def main():
-    # Query Italian Chamber of Deputies for approved acts from 19th Legislature (Nov 2025)
+    parser = argparse.ArgumentParser(description="Camera dei Deputati – atti approvati definitivamente")
+    parser.add_argument("anno", type=int, help="Anno (es. 2025)")
+    parser.add_argument("mese", type=int, nargs="?", default=None, help="Mese (1-12, opzionale)")
+    args = parser.parse_args()
+
+    # Build date-prefix for the REGEX filter: "^YYYY" or "^YYYYMM"
+    date_prefix = str(args.anno)
+    label = str(args.anno)
+    if args.mese is not None:
+        date_prefix += f"{args.mese:02d}"
+        label += f"_{args.mese:02d}"
+
     endpoint = "http://dati.camera.it/sparql"
 
-    query = """
+    query = f"""
     PREFIX ocd: <http://dati.camera.it/ocd/>
     PREFIX dc: <http://purl.org/dc/elements/1.1/>
     PREFIX dcterms: <http://purl.org/dc/terms/>
     PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
 
-    SELECT ?atto ?numero ?iniziativa ?presentazione ?titolo ?isReferencedBy (MAX(?dataApprovazione) AS ?dataApprovazione) {
-        {
-            SELECT DISTINCT ?atto {
+    SELECT ?atto ?numero ?iniziativa ?presentazione ?titolo ?isReferencedBy (MAX(?dataApprovazione) AS ?dataApprovazione) {{
+        {{
+            SELECT DISTINCT ?atto {{
                 ?atto a ocd:atto;
                     ocd:rif_leg <http://dati.camera.it/ocd/legislatura.rdf/repubblica_19>;
                     ocd:rif_statoIter ?statoIter .
                 ?statoIter dc:title ?fase ; dc:date ?dataIter .
-                FILTER(CONTAINS(LCASE(?fase), "approvato"))
-                FILTER(REGEX(?dataIter, "^202510"))
-            }
-        }
+                FILTER(CONTAINS(?fase, "Approvato definitivamente"))
+                FILTER(REGEX(?dataIter, "^{date_prefix}"))
+            }}
+        }}
         ?atto ocd:iniziativa ?iniziativa;
             dc:identifier ?numero;
             dc:date ?presentazione;
             dc:title ?titolo .
-        OPTIONAL { ?atto dcterms:isReferencedBy ?isReferencedBy . }
-        OPTIONAL {
+        OPTIONAL {{ ?atto dcterms:isReferencedBy ?isReferencedBy . }}
+        OPTIONAL {{
             ?votazione a ocd:votazione; ocd:rif_attoCamera ?atto;
                 ocd:approvato "1"^^xsd:integer;
                 dc:date ?dataApprovazione .
-        }
-    } GROUP BY ?atto ?numero ?iniziativa ?presentazione ?titolo ?isReferencedBy
+        }}
+    }} GROUP BY ?atto ?numero ?iniziativa ?presentazione ?titolo ?isReferencedBy
       ORDER BY ?presentazione
     """
 
@@ -119,18 +136,21 @@ def main():
     bindings = results.get("results", {}).get("bindings", [])
     print(f"Total results: {len(bindings)}")
 
-    # --- enrich each row with normattiva links from the isReferencedBy page ---
-    print(f"\n  Fetching Normattiva links from Camera pages...")
+    # --- enrich each row with normattiva + senato links from the isReferencedBy page ---
+    print(f"\n  Fetching Normattiva / Senato links from Camera pages...")
     for i, b in enumerate(bindings):
         numero  = b.get("numero", {}).get("value", "")
         ref_url = b.get("isReferencedBy", {}).get("value", "")
         if ref_url:
             print(f"    [{i+1}/{len(bindings)}] {numero:<6} {ref_url}", end=" … ", flush=True)
-            links = fetch_normattiva_links(ref_url)
-            b["normattiva_uri"] = {"value": "; ".join(links), "type": "uri"}
-            print(f"{len(links)} link(s)")
+            norm_links, sen_links = fetch_page_links(ref_url)
+            b["normattiva_uri"] = {"value": "; ".join(norm_links), "type": "uri"}
+            b["senato_uri"]      = {"value": "; ".join(sen_links),  "type": "uri"}
+            flag = " ⚠ >1 senato" if len(sen_links) > 1 else ""
+            print(f"norm={len(norm_links)} sen={len(sen_links)}{flag}")
         else:
             b["normattiva_uri"] = {"value": "", "type": "literal"}
+            b["senato_uri"]     = {"value": "", "type": "literal"}
 
     # Create output directory
     output_dir = Path("output")
@@ -138,7 +158,7 @@ def main():
 
     # Generate filename with timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = output_dir / f"legislatura_19_approved_nov2025_{timestamp}.csv"
+    output_file = output_dir / f"leg_19_app_def_{label}_{timestamp}.csv"
 
     # Save results to CSV
     save_to_csv(results, output_file)
