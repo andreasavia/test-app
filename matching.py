@@ -21,11 +21,9 @@ Confidence levels:
   no_match   — no candidate found
 
 Usage:
-    python matching.py                        # batch over Nov 2025 (default input)
-    python matching.py --input <path.json>    # custom norms JSON
+    python matching.py   # prompts for anno / mese, fetches norms live
 """
 
-import argparse
 import html
 import json
 import re
@@ -223,22 +221,45 @@ def classify_norm_type(descrizione: str) -> str:
     return "ALTRO"
 
 
+def fetch_norms(anno: int, mese: int) -> list[dict]:
+    """Call Normattiva ricerca/avanzata and paginate through all results."""
+    url = f"{NORMATTIVA_BASE}/ricerca/avanzata"
+    atti = []
+    pagina = 1
+    while True:
+        payload = {
+            "orderType": "vecchio",
+            "annoProvvedimento": anno,
+            "meseProvvedimento": mese,
+            "paginazione": {
+                "paginaCorrente": pagina,
+                "numeroElementiPerPagina": 100
+            }
+        }
+        print(f"  Normattiva ricerca/avanzata: anno={anno}, mese={mese}, pagina={pagina}")
+        r = requests.post(url, json=payload, headers=HEADERS, timeout=60)
+        r.raise_for_status()
+        batch = r.json().get("listaAtti", [])
+        if not batch:
+            break
+        atti.extend(batch)
+        pagina += 1
+    return atti
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Batch match Normattiva -> Camera")
-    parser.add_argument("--input", type=Path,
-                        default=Path("output/norme_in_vigore/norme_202511_raw_20260202_160857.json"),
-                        help="Path to norme_in_vigore raw JSON")
-    parser.add_argument("--month", type=str, default="2025-11",
-                        help="Filter dataGU prefix (default: 2025-11)")
-    args = parser.parse_args()
+    anno = int(input("Anno (es. 2025): "))
+    mese = int(input("Mese (1-12):     "))
+    month_prefix = f"{anno}-{mese:02d}"
 
-    norms_data = json.loads(args.input.read_text())
-    all_norms = norms_data["listaAtti"]
+    print(f"\n  Fetching norms from Normattiva for {anno}/{mese:02d}...")
+    all_norms = fetch_norms(anno, mese)
+    print(f"  Normattiva returned {len(all_norms)} norms total")
 
-    # Filter to the target month and Camera-eligible types
+    # Filter to LEGGEs published in the requested month
     targets = [
         a for a in all_norms
-        if a.get("dataGU", "").startswith(args.month)
+        if a.get("dataGU", "").startswith(month_prefix)
         and classify_norm_type(a.get("descrizioneAtto", "")) in CAMERA_TYPES
     ]
     targets.sort(key=lambda a: a.get("dataGU", ""))
@@ -246,9 +267,9 @@ def main():
     output_dir = Path("output/matching")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print("=" * 70)
-    print(f"BATCH MATCHING: Normattiva -> Camera dei Deputati  [{args.month}]")
-    print(f"Input: {args.input.name}  |  Eligible norms: {len(targets)}")
+    print("\n" + "=" * 70)
+    print(f"BATCH MATCHING: Normattiva -> Camera dei Deputati  [{month_prefix}]")
+    print(f"LEGGEs to match: {len(targets)}")
     print("=" * 70)
 
     results = []
@@ -287,7 +308,7 @@ def main():
     print(f"\n  exact: {exact}   ambiguous: {ambig}   no_match: {nomatch}")
 
     # --- save ---
-    month_tag = args.month.replace("-", "")
+    month_tag = month_prefix.replace("-", "")
     out_file = output_dir / f"batch_matching_{month_tag}.json"
     out_file.write_text(json.dumps(results, indent=2, ensure_ascii=False))
     print(f"\n  ✓ Saved: {out_file}")
