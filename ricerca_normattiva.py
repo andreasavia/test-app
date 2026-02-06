@@ -111,14 +111,20 @@ def extract_links(html):
 
 def fetch_approfondimenti(session, uri):
     """Load the N2Ls page, find active approfondimento endpoints, fetch and parse links.
-    Returns dict: {column_name: "link1; link2; ..."} for all APPROFONDIMENTO_COLUMNS."""
+    Returns dict: {column_name: "link1; link2; ...", "gu_link": "..."} for all APPROFONDIMENTO_COLUMNS."""
     result = {col: "" for col in APPROFONDIMENTO_COLUMNS}
+    result["gu_link"] = ""
 
     try:
         resp = session.get(uri, timeout=30)
         resp.raise_for_status()
     except Exception:
         return result
+
+    # Extract GU link (gazzettaufficiale.it)
+    gu_match = re.search(r'href="(https?://www\.gazzettaufficiale\.it/[^"]+)"', resp.text)
+    if gu_match:
+        result["gu_link"] = gu_match.group(1).replace("&amp;", "&")
 
     # Find every <a> that has a data-href; match its text to a column
     for m in re.finditer(r'<a\s[^>]*data-href="([^"]+)"[^>]*>\s*(.*?)\s*</a>', resp.text, re.DOTALL):
@@ -220,6 +226,10 @@ def save_markdown(atti: list, vault_dir: Path) -> None:
         lines.append(f"numero-gu: {numero_gu}")
         if uri:
             lines.append(f"normattiva-urn: {uri}")
+        # GU link extracted from page
+        gu_link = atto.get("gu_link", "")
+        if gu_link:
+            lines.append(f"gu-link: {gu_link}")
         lines.append(f"titolo-atto: \"{titolo}\"")
         lines.append(f"descrizione-atto: \"{descrizione}\"")
         # Add all approfondimenti as metadata
