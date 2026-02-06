@@ -109,6 +109,75 @@ def extract_links(html):
     return links
 
 
+def fetch_camera_metadata(session, camera_url: str) -> dict:
+    """Fetch and parse metadata from a camera.it lavori preparatori page.
+    Returns dict with camera-atto, legislatura, natura, data-presentazione, iniziativa-dei-deputati."""
+    result = {}
+
+    # Parse URL to extract legislatura and atto number
+    # URL format: http://www.camera.it/uri-res/N2Ls?urn:camera-it:parlamento:scheda.progetto.legge:camera;19.legislatura;1621
+    url_match = re.search(r'(\d+)\.legislatura;(\d+)', camera_url)
+    if url_match:
+        legislatura = url_match.group(1)
+        atto_num = url_match.group(2)
+        result["legislatura"] = legislatura
+        result["camera-atto"] = f"C. {atto_num}"
+        result["camera-atto-iri"] = f"http://dati.camera.it/ocd/attocamera.rdf/ac{legislatura}_{atto_num}"
+
+    try:
+        resp = session.get(camera_url, timeout=30)
+        resp.raise_for_status()
+        html = resp.text
+    except Exception:
+        return result
+
+    # Extract natura (proposal type)
+    natura_match = re.search(r'Natura:\s*</span>\s*([^<]+)', html)
+    if natura_match:
+        result["natura"] = natura_match.group(1).strip()
+
+    # Extract presentation date
+    data_match = re.search(r'Presentat[oa]\s+il\s+(\d+\s+\w+\s+\d{4})', html)
+    if data_match:
+        result["data-presentazione"] = data_match.group(1)
+
+    # Extract iniziativa dei deputati (first signers only)
+    # Look for "C. NNN:" pattern in iniziativa section, then extract names from links
+    # The section ends before "Assegnazione" or next major section
+    iniziativa_match = re.search(
+        r'Iniziativa\s+de[il]\s+deputat[io].*?'  # Section header
+        r'C\.\s*(\d+)\s*:'                        # "C. 1621:"
+        r'(.*?)'                                   # Names section
+        r'(?=\n\s*\n\s*[A-Z]|\n\s*Assegn|<h\d|</table)',  # End markers
+        html, re.DOTALL | re.IGNORECASE
+    )
+    if iniziativa_match:
+        section = iniziativa_match.group(2)
+        # Extract names and links from anchor tags
+        deputies = []
+        seen_names = set()
+        for m in re.finditer(r'href="([^"]*schedaDeputato[^"]*)"[^>]*>\s*([A-Z][A-Z]+(?:\s+[A-Z][A-Z]+)*\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s*</a>', section):
+            link = m.group(1).replace("&amp;", "&")
+            if not link.startswith("http"):
+                link = "https://www.camera.it" + link
+            name = re.sub(r'\s+', ' ', m.group(2)).strip()
+            if name and name not in seen_names:
+                seen_names.add(name)
+                deputies.append({"name": name, "link": link})
+        if deputies:
+            result["iniziativa-dei-deputati"] = deputies
+
+    # Extract final vote link if available
+    voto_match = re.search(r'href="([^"]*votazioni[^"]*schedaVotazione[^"]*)"', html)
+    if voto_match:
+        link = voto_match.group(1).replace("&amp;", "&")
+        if not link.startswith("http"):
+            link = "https://www.camera.it" + link
+        result["camera-votazione-finale"] = link
+
+    return result
+
+
 def fetch_approfondimenti(session, uri):
     """Load the N2Ls page, find active approfondimento endpoints, fetch and parse links.
     Returns dict: {column_name: "link1; link2; ...", "gu_link": "..."} for all APPROFONDIMENTO_COLUMNS."""
@@ -226,6 +295,10 @@ def save_markdown(atti: list, vault_dir: Path) -> None:
         lines.append(f"numero-gu: {numero_gu}")
         if uri:
             lines.append(f"normattiva-urn: {uri}")
+        # Build normattiva-link
+        if data_gu and codice:
+            normattiva_link = f"https://www.normattiva.it/atto/caricaDettaglioAtto?atto.dataPubblicazioneGazzetta={data_gu}&atto.codiceRedazionale={codice}"
+            lines.append(f"normattiva-link: {normattiva_link}")
         # GU link extracted from page
         gu_link = atto.get("gu_link", "")
         if gu_link:
@@ -241,6 +314,25 @@ def save_markdown(atti: list, vault_dir: Path) -> None:
                 for link in content.split("\n"):
                     if link.strip():
                         lines.append(f"  - {link.strip()}")
+
+        # Camera metadata (from lavori preparatori)
+        if atto.get("legislatura"):
+            lines.append(f"legislatura: {atto.get('legislatura')}")
+        if atto.get("camera-atto"):
+            lines.append(f"camera-atto: {atto.get('camera-atto')}")
+        if atto.get("camera-atto-iri"):
+            lines.append(f"camera-atto-iri: {atto.get('camera-atto-iri')}")
+        if atto.get("natura"):
+            lines.append(f"natura: \"{atto.get('natura')}\"")
+        if atto.get("data-presentazione"):
+            lines.append(f"data-presentazione: \"{atto.get('data-presentazione')}\"")
+        if atto.get("iniziativa-dei-deputati"):
+            lines.append("iniziativa-dei-deputati:")
+            for dep in atto.get("iniziativa-dei-deputati", []):
+                lines.append(f"  - \"[{dep['name']}]({dep['link']})\"")
+        if atto.get("camera-votazione-finale"):
+            lines.append(f"camera-votazione-finale: {atto.get('camera-votazione-finale')}")
+
         lines.append("---")
 
         with filepath.open("w", encoding="utf-8") as f:
@@ -304,6 +396,19 @@ def main():
         atto.update(appro)
         populated = [col for col in APPROFONDIMENTO_COLUMNS if appro[col]]
         print(f"{', '.join(populated) if populated else 'nessuno'}")
+
+    # Fetch camera.it metadata from lavori_preparatori
+    print("[Fetching camera.it metadata]")
+    for i, atto in enumerate(atti):
+        lavori = atto.get("lavori_preparatori", "")
+        camera_links = [l for l in lavori.split("\n") if "camera.it" in l]
+        if camera_links:
+            print(f"  [{i+1}/{len(atti)}] {atto.get('codiceRedazionale', '')}...", end=" ", flush=True)
+            camera_meta = fetch_camera_metadata(session, camera_links[0])
+            atto.update(camera_meta)
+            print(f"legislatura {camera_meta.get('legislatura', '?')}, {camera_meta.get('camera-atto', '?')}")
+        else:
+            print(f"  [{i+1}/{len(atti)}] {atto.get('codiceRedazionale', '')}... no camera.it link")
 
     # Save
     print("[Saving]")
