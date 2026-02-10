@@ -533,17 +533,20 @@ def save_markdown(atti: list, vault_dir: Path) -> None:
         data_emanazione = atto.get("dataEmanazione", "")[:10]
         uri = atto.get("normattiva_uri", "")
 
-        # Parse year/month from dataEmanazione
+        # Parse year/month/day from dataEmanazione
         try:
             eman_date = datetime.strptime(data_emanazione, "%Y-%m-%d")
             year = str(eman_date.year)
             month = f"{eman_date.month:02d}"
+            day = f"{eman_date.day:02d}"
         except ValueError:
             year = "unknown"
             month = "00"
+            day = "00"
 
-        # Create folder: vault/YYYY/MM/numero/
-        norm_dir = vault_dir / year / month / str(numero_provv)
+        # Create folder: vault/YYYY/MM/DD/n. numero/
+        folder_name = f"n. {numero_provv}"
+        norm_dir = vault_dir / year / month / day / folder_name
         norm_dir.mkdir(parents=True, exist_ok=True)
 
         # Main markdown file
