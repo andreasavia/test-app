@@ -12,6 +12,7 @@ import json
 import html as html_module
 import re
 import requests
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from datetime import datetime
 
@@ -110,72 +111,200 @@ def extract_links(html):
 
 
 def fetch_camera_metadata(session, camera_url: str) -> dict:
-    """Fetch and parse metadata from a camera.it lavori preparatori page.
+    """Fetch and parse metadata from a camera.it RDF endpoint.
     Returns dict with camera-atto, legislatura, natura, data-presentazione, iniziativa-dei-deputati."""
     result = {}
 
     # Parse URL to extract legislatura and atto number
     # URL format: http://www.camera.it/uri-res/N2Ls?urn:camera-it:parlamento:scheda.progetto.legge:camera;19.legislatura;1621
     url_match = re.search(r'(\d+)\.legislatura;(\d+)', camera_url)
-    if url_match:
-        legislatura = url_match.group(1)
-        atto_num = url_match.group(2)
-        result["legislatura"] = legislatura
-        result["camera-atto"] = f"C. {atto_num}"
-        result["camera-atto-iri"] = f"http://dati.camera.it/ocd/attocamera.rdf/ac{legislatura}_{atto_num}"
+    if not url_match:
+        return result
 
+    legislatura = url_match.group(1)
+    atto_num = url_match.group(2)
+    result["legislatura"] = legislatura
+    result["camera-atto"] = f"C. {atto_num}"
+
+    rdf_url = f"http://dati.camera.it/ocd/attocamera.rdf/ac{legislatura}_{atto_num}"
+    result["camera-atto-iri"] = rdf_url
+
+    # Request RDF/XML format explicitly
     try:
-        resp = session.get(camera_url, timeout=30)
+        resp = session.get(rdf_url, headers={"Accept": "application/rdf+xml"}, timeout=30)
         resp.raise_for_status()
-        html = resp.text
+        rdf_text = resp.text
     except Exception:
         return result
 
-    # Extract natura (proposal type)
-    natura_match = re.search(r'Natura:\s*</span>\s*([^<]+)', html)
-    if natura_match:
-        result["natura"] = natura_match.group(1).strip()
+    # Parse RDF/XML
+    try:
+        root = ET.fromstring(rdf_text)
+    except ET.ParseError:
+        return result
 
-    # Extract presentation date
-    data_match = re.search(r'Presentat[oa]\s+il\s+(\d+\s+\w+\s+\d{4})', html)
-    if data_match:
-        result["data-presentazione"] = data_match.group(1)
+    # Namespaces used in the RDF
+    ns = {
+        'rdf': 'http://www.w3.org/1999/02/22-rdf-syntax-ns#',
+        'dc': 'http://purl.org/dc/elements/1.1/',
+        'ocd': 'http://dati.camera.it/ocd/',
+        'rdfs': 'http://www.w3.org/2000/01/rdf-schema#',
+        'foaf': 'http://xmlns.com/foaf/0.1/',
+    }
 
-    # Extract iniziativa dei deputati (first signers only)
-    # Look for "C. NNN:" pattern in iniziativa section, then extract names from links
-    # The section ends before "Assegnazione" or next major section
-    iniziativa_match = re.search(
-        r'Iniziativa\s+de[il]\s+deputat[io].*?'  # Section header
-        r'C\.\s*(\d+)\s*:'                        # "C. 1621:"
-        r'(.*?)'                                   # Names section
-        r'(?=\n\s*\n\s*[A-Z]|\n\s*Assegn|<h\d|</table)',  # End markers
-        html, re.DOTALL | re.IGNORECASE
-    )
-    if iniziativa_match:
-        section = iniziativa_match.group(2)
-        # Extract names and links from anchor tags
-        deputies = []
-        seen_names = set()
-        for m in re.finditer(r'href="([^"]*schedaDeputato[^"]*)"[^>]*>\s*([A-Z][A-Z]+(?:\s+[A-Z][A-Z]+)*\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\s*</a>', section):
-            link = m.group(1).replace("&amp;", "&")
+    # Find any Description element (the main one)
+    atto_elem = None
+    for desc in root.findall('.//rdf:Description', ns):
+        about = desc.get(f"{{{ns['rdf']}}}about", "")
+        if f"ac{legislatura}_{atto_num}" in about:
+            atto_elem = desc
+            break
+
+    if atto_elem is None:
+        # Fallback: try first Description
+        descriptions = root.findall('.//rdf:Description', ns)
+        if descriptions:
+            atto_elem = descriptions[0]
+
+    if atto_elem is None:
+        return result
+
+    # Extract natura (dc:type)
+    tipo_elem = atto_elem.find('dc:type', ns)
+    if tipo_elem is not None and tipo_elem.text:
+        result["camera-natura"] = tipo_elem.text.strip()
+
+    # Extract iniziativa (ocd:iniziativa) - Governo or Parlamentare
+    iniziativa_elem = atto_elem.find('ocd:iniziativa', ns)
+    if iniziativa_elem is not None and iniziativa_elem.text:
+        result["camera-iniziativa"] = iniziativa_elem.text.strip()
+
+    # Extract presentation date (dc:date) - format YYYYMMDD
+    date_elem = atto_elem.find('dc:date', ns)
+    if date_elem is not None and date_elem.text:
+        raw_date = date_elem.text.strip()
+        # Convert YYYYMMDD to readable format
+        if len(raw_date) == 8 and raw_date.isdigit():
+            try:
+                dt = datetime.strptime(raw_date, "%Y%m%d")
+                months = ["", "gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno",
+                          "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"]
+                result["camera-data-presentazione"] = f"{dt.day} {months[dt.month]} {dt.year}"
+            except ValueError:
+                result["camera-data-presentazione"] = raw_date
+        else:
+            result["camera-data-presentazione"] = raw_date
+
+    # Extract PDF link (dc:relation)
+    pdf_links = []
+    for relation_elem in atto_elem.findall('dc:relation', ns):
+        resource = relation_elem.get(f"{{{ns['rdf']}}}resource", "")
+        if resource and resource.endswith('.pdf'):
+            pdf_links.append(resource)
+    if pdf_links:
+        result["camera-pdf"] = pdf_links
+
+    # Extract creator (first signer) - dc:creator contains name directly
+    deputies = []
+    for creator_elem in atto_elem.findall('dc:creator', ns):
+        if creator_elem.text:
+            name = creator_elem.text.strip()
+            if not any(d["name"] == name for d in deputies):
+                deputies.append({"name": name, "link": ""})
+
+    # Get primo_firmatario links
+    primo_links = []
+    for primo_elem in atto_elem.findall('ocd:primo_firmatario', ns):
+        resource = primo_elem.get(f"{{{ns['rdf']}}}resource", "")
+        if resource:
+            primo_links.append(build_scheda_link(resource, legislatura))
+
+    # Match deputies with links
+    for i, dep in enumerate(deputies):
+        if i < len(primo_links) and primo_links[i]:
+            dep["link"] = primo_links[i]
+
+    # Extract additional signers (dc:contributor contains names, ocd:altro_firmatario has links)
+    contributors = []
+    for contrib_elem in atto_elem.findall('dc:contributor', ns):
+        if contrib_elem.text:
+            contributors.append(contrib_elem.text.strip())
+
+    altro_firmatari = []
+    for altro_elem in atto_elem.findall('ocd:altro_firmatario', ns):
+        resource = altro_elem.get(f"{{{ns['rdf']}}}resource", "")
+        if resource:
+            altro_firmatari.append(resource)
+
+    # Match contributors with their links
+    for i, name in enumerate(contributors):
+        if not any(d["name"] == name for d in deputies):
+            link = ""
+            if i < len(altro_firmatari):
+                link = build_scheda_link(altro_firmatari[i], legislatura)
+            deputies.append({"name": name, "link": link})
+
+    if deputies:
+        result["camera-firmatari"] = deputies
+
+    # Extract relatori (rapporteurs)
+    relatori_refs = []
+    for rel_elem in atto_elem.findall('ocd:rif_relatore', ns):
+        resource = rel_elem.get(f"{{{ns['rdf']}}}resource", "")
+        if resource:
+            relatori_refs.append(resource)
+
+    if relatori_refs:
+        relatori = fetch_relatori_names(session, relatori_refs, ns)
+        if relatori:
+            result["camera-relatori"] = relatori
+
+    # For final vote, we still need HTML (not in RDF) - fetch from HTML page
+    try:
+        html_resp = session.get(camera_url, timeout=30)
+        html_resp.raise_for_status()
+        voto_match = re.search(r'href="([^"]*votazioni[^"]*schedaVotazione[^"]*)"', html_resp.text)
+        if voto_match:
+            link = voto_match.group(1).replace("&amp;", "&")
             if not link.startswith("http"):
                 link = "https://www.camera.it" + link
-            name = re.sub(r'\s+', ' ', m.group(2)).strip()
-            if name and name not in seen_names:
-                seen_names.add(name)
-                deputies.append({"name": name, "link": link})
-        if deputies:
-            result["iniziativa-dei-deputati"] = deputies
-
-    # Extract final vote link if available
-    voto_match = re.search(r'href="([^"]*votazioni[^"]*schedaVotazione[^"]*)"', html)
-    if voto_match:
-        link = voto_match.group(1).replace("&amp;", "&")
-        if not link.startswith("http"):
-            link = "https://www.camera.it" + link
-        result["camera-votazione-finale"] = link
+            result["camera-votazione-finale"] = link
+    except Exception:
+        pass
 
     return result
+
+
+def fetch_relatori_names(session, relatori_refs: list, ns: dict) -> list:
+    """Fetch relatore names from their RDF URIs."""
+    relatori = []
+    for ref in relatori_refs:
+        try:
+            resp = session.get(ref, headers={"Accept": "application/rdf+xml"}, timeout=10)
+            resp.raise_for_status()
+            root = ET.fromstring(resp.text)
+            # Find the Description with dc:creator (the relatore name)
+            for desc in root.findall('.//rdf:Description', ns):
+                creator = desc.find('dc:creator', ns)
+                if creator is not None and creator.text:
+                    name = creator.text.strip()
+                    if name and name not in relatori:
+                        relatori.append(name)
+                    break
+        except Exception:
+            continue
+    return relatori
+
+
+def build_scheda_link(resource_uri: str, legislatura: str) -> str:
+    """Build scheda deputato link from resource URI."""
+    # Extract person ID from URI like http://dati.camera.it/ocd/deputato.rdf/d50204_19
+    # Format: d{personId}_{legislatura}
+    match = re.search(r'/d(\d+)_\d+', resource_uri)
+    if match:
+        person_id = match.group(1)
+        return f"https://documenti.camera.it/apps/commonServices/getDocumento.ashx?sezione=deputati&tipoDoc=schedaDeputato&idlegislatura={legislatura}&idPersona={person_id}"
+    return resource_uri
 
 
 def fetch_approfondimenti(session, uri):
@@ -315,21 +444,34 @@ def save_markdown(atti: list, vault_dir: Path) -> None:
                     if link.strip():
                         lines.append(f"  - {link.strip()}")
 
-        # Camera metadata (from lavori preparatori)
+        # Camera metadata (from lavori preparatori RDF)
         if atto.get("legislatura"):
-            lines.append(f"legislatura: {atto.get('legislatura')}")
+            lines.append(f"camera-legislatura: {atto.get('legislatura')}")
         if atto.get("camera-atto"):
             lines.append(f"camera-atto: {atto.get('camera-atto')}")
         if atto.get("camera-atto-iri"):
             lines.append(f"camera-atto-iri: {atto.get('camera-atto-iri')}")
-        if atto.get("natura"):
-            lines.append(f"natura: \"{atto.get('natura')}\"")
-        if atto.get("data-presentazione"):
-            lines.append(f"data-presentazione: \"{atto.get('data-presentazione')}\"")
-        if atto.get("iniziativa-dei-deputati"):
-            lines.append("iniziativa-dei-deputati:")
-            for dep in atto.get("iniziativa-dei-deputati", []):
-                lines.append(f"  - \"[{dep['name']}]({dep['link']})\"")
+        if atto.get("camera-natura"):
+            lines.append(f"camera-natura: \"{atto.get('camera-natura')}\"")
+        if atto.get("camera-iniziativa"):
+            lines.append(f"camera-iniziativa: \"{atto.get('camera-iniziativa')}\"")
+        if atto.get("camera-data-presentazione"):
+            lines.append(f"camera-data-presentazione: \"{atto.get('camera-data-presentazione')}\"")
+        if atto.get("camera-pdf"):
+            lines.append("camera-pdf:")
+            for pdf in atto.get("camera-pdf", []):
+                lines.append(f"  - {pdf}")
+        if atto.get("camera-firmatari"):
+            lines.append("camera-firmatari:")
+            for dep in atto.get("camera-firmatari", []):
+                if dep.get('link'):
+                    lines.append(f"  - \"[{dep['name']}]({dep['link']})\"")
+                else:
+                    lines.append(f"  - \"{dep['name']}\"")
+        if atto.get("camera-relatori"):
+            lines.append("camera-relatori:")
+            for rel in atto.get("camera-relatori", []):
+                lines.append(f"  - \"{rel}\"")
         if atto.get("camera-votazione-finale"):
             lines.append(f"camera-votazione-finale: {atto.get('camera-votazione-finale')}")
 
