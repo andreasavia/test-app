@@ -290,6 +290,19 @@ def fetch_camera_metadata(session, camera_url: str) -> dict:
             if not link.startswith("http"):
                 link = "https://www.camera.it" + link
             result["camera-votazione-finale"] = link
+
+        # Extract dossier links
+        dossier_links = []
+        dossier_pattern = r'href="([^"]*dossier[^"]*)"'
+        for match in re.finditer(dossier_pattern, html_text, re.IGNORECASE):
+            link = match.group(1).replace("&amp;", "&")
+            if not link.startswith("http"):
+                link = "https://www.camera.it" + link
+            if link not in dossier_links:
+                dossier_links.append(link)
+
+        if dossier_links:
+            result["camera-dossier"] = dossier_links
     except Exception:
         pass
 
@@ -618,6 +631,10 @@ def save_markdown(atti: list, vault_dir: Path) -> None:
                 lines.append(f"  - \"{rel}\"")
         if atto.get("camera-votazione-finale"):
             lines.append(f"camera-votazione-finale: {atto.get('camera-votazione-finale')}")
+        if atto.get("camera-dossier"):
+            lines.append("camera-dossier:")
+            for dossier_link in atto.get("camera-dossier", []):
+                lines.append(f"  - {dossier_link}")
 
         lines.append("---")
 
