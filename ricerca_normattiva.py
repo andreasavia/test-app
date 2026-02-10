@@ -212,19 +212,29 @@ def fetch_camera_metadata(session, camera_url: str) -> dict:
             if not any(d["name"] == name for d in deputies):
                 deputies.append({"name": name, "link": ""})
 
-    # Get primo_firmatario links
-    primo_links = []
+    # Get primo_firmatario URIs (handle both resource URIs and blank nodes)
+    primo_uris = []
     for primo_elem in atto_elem.findall('ocd:primo_firmatario', ns):
+        # Try direct resource URI first (parliamentary bills)
         resource = primo_elem.get(f"{{{ns['rdf']}}}resource", "")
         if resource:
-            primo_links.append(build_scheda_link(resource, legislatura))
+            primo_uris.append(resource)
+        else:
+            # Try blank node (government bills)
+            node_id = primo_elem.get(f"{{{ns['rdf']}}}nodeID", "")
+            if node_id:
+                persona_uri = resolve_blank_node(root, node_id, ns)
+                if persona_uri:
+                    primo_uris.append(persona_uri)
 
-    # Match deputies with links
+    # Fetch groups for all primo_firmatario
     for i, dep in enumerate(deputies):
-        if i < len(primo_links) and primo_links[i]:
-            dep["link"] = primo_links[i]
+        if i < len(primo_uris):
+            group = fetch_parliamentary_group(session, primo_uris[i], ns, legislatura)
+            if group:
+                dep["group"] = group
 
-    # Extract additional signers (dc:contributor contains names, ocd:altro_firmatario has links)
+    # Extract additional signers (dc:contributor contains names, ocd:altro_firmatario has URIs)
     contributors = []
     for contrib_elem in atto_elem.findall('dc:contributor', ns):
         if contrib_elem.text:
@@ -235,14 +245,21 @@ def fetch_camera_metadata(session, camera_url: str) -> dict:
         resource = altro_elem.get(f"{{{ns['rdf']}}}resource", "")
         if resource:
             altro_firmatari.append(resource)
+        else:
+            # Try blank node
+            node_id = altro_elem.get(f"{{{ns['rdf']}}}nodeID", "")
+            if node_id:
+                persona_uri = resolve_blank_node(root, node_id, ns)
+                if persona_uri:
+                    altro_firmatari.append(persona_uri)
 
-    # Match contributors with their links
+    # Match contributors with their groups
     for i, name in enumerate(contributors):
         if not any(d["name"] == name for d in deputies):
-            link = ""
+            group = ""
             if i < len(altro_firmatari):
-                link = build_scheda_link(altro_firmatari[i], legislatura)
-            deputies.append({"name": name, "link": link})
+                group = fetch_parliamentary_group(session, altro_firmatari[i], ns, legislatura)
+            deputies.append({"name": name, "group": group})
 
     if deputies:
         result["camera-firmatari"] = deputies
@@ -259,11 +276,15 @@ def fetch_camera_metadata(session, camera_url: str) -> dict:
         if relatori:
             result["camera-relatori"] = relatori
 
-    # For final vote, we still need HTML (not in RDF) - fetch from HTML page
+    # Fetch HTML page for votazione-finale and potentially override with HTML-based firmatari
+    html_text = None
     try:
         html_resp = session.get(camera_url, timeout=30)
         html_resp.raise_for_status()
-        voto_match = re.search(r'href="([^"]*votazioni[^"]*schedaVotazione[^"]*)"', html_resp.text)
+        html_text = html_resp.text
+
+        # Extract final vote
+        voto_match = re.search(r'href="([^"]*votazioni[^"]*schedaVotazione[^"]*)"', html_text)
         if voto_match:
             link = voto_match.group(1).replace("&amp;", "&")
             if not link.startswith("http"):
@@ -272,7 +293,42 @@ def fetch_camera_metadata(session, camera_url: str) -> dict:
     except Exception:
         pass
 
+    # For government bills, parse HTML to get ministerial roles instead of groups
+    if html_text and result.get("camera-iniziativa") == "Governo":
+        html_firmatari = parse_html_firmatari(html_text, legislatura)
+        if html_firmatari:
+            result["camera-firmatari"] = html_firmatari
+
     return result
+
+
+def parse_html_firmatari(html: str, legislatura: str) -> list:
+    """Parse firmatari from HTML page for government bills."""
+    firmatari = []
+
+    # Look for <div class="iniziativa"> for government bills
+    iniziativa_match = re.search(r'<div class="iniziativa">(.*?)</div>', html, re.DOTALL)
+    if not iniziativa_match:
+        return firmatari
+
+    section = iniziativa_match.group(1)
+
+    # Extract each person with their role
+    # Pattern: <a href="...idPersona=123">NAME</a></span> (<em>ROLE</em>)
+    pattern = r'<a\s+href="[^"]*idPersona=(\d+)"[^>]*>([^<]+)</a>\s*</span>\s*\(<em>([^<]+)</em>\)'
+
+    for match in re.finditer(pattern, section):
+        person_id = match.group(1)
+        name = re.sub(r'\s+', ' ', match.group(2)).strip()
+        role = match.group(3).strip()
+
+        firmatari.append({
+            "name": name,
+            "role": role,
+            "link": f"https://documenti.camera.it/apps/commonServices/getDocumento.ashx?sezione=deputati&tipoDoc=schedaDeputato&idlegislatura={legislatura}&idPersona={person_id}"
+        })
+
+    return firmatari
 
 
 def fetch_relatori_names(session, relatori_refs: list, ns: dict) -> list:
@@ -296,14 +352,95 @@ def fetch_relatori_names(session, relatori_refs: list, ns: dict) -> list:
     return relatori
 
 
+def resolve_blank_node(root, node_id: str, ns: dict) -> str:
+    """Resolve a blank node to get the persona/deputato URI."""
+    for desc in root.findall('.//rdf:Description', ns):
+        desc_node_id = desc.get(f"{{{ns['rdf']}}}nodeID", "")
+        if desc_node_id == node_id:
+            # Found the blank node, look for ocd:rif_persona
+            rif_persona = desc.find('ocd:rif_persona', ns)
+            if rif_persona is not None:
+                resource = rif_persona.get(f"{{{ns['rdf']}}}resource", "")
+                if resource:
+                    return resource
+    return ""
+
+
+def fetch_parliamentary_group(session, person_uri: str, ns: dict, legislatura: str = "19") -> str:
+    """Fetch parliamentary group abbreviation from person/deputato RDF."""
+    try:
+        # If persona.rdf URI, convert to deputato.rdf URI
+        # persona.rdf/p50204 → deputato.rdf/d50204_19
+        if 'persona.rdf' in person_uri:
+            person_match = re.search(r'/p(\d+)', person_uri)
+            if person_match:
+                person_id = person_match.group(1)
+                person_uri = f"http://dati.camera.it/ocd/deputato.rdf/d{person_id}_{legislatura}"
+
+        resp = session.get(person_uri, headers={"Accept": "application/rdf+xml"}, timeout=10)
+        resp.raise_for_status()
+        root = ET.fromstring(resp.text)
+
+        # Look for gruppo parlamentare reference
+        gruppo_uri = None
+        for desc in root.findall('.//rdf:Description', ns):
+            gruppo_elem = desc.find('ocd:rif_gruppoParlamentare', ns)
+            if gruppo_elem is not None:
+                gruppo_uri = gruppo_elem.get(f"{{{ns['rdf']}}}resource", "")
+                if gruppo_uri:
+                    break
+
+        if not gruppo_uri:
+            return ""
+
+        # Fetch the group RDF to get the abbreviation
+        gruppo_resp = session.get(gruppo_uri, headers={"Accept": "application/rdf+xml"}, timeout=10)
+        gruppo_resp.raise_for_status()
+        gruppo_root = ET.fromstring(gruppo_resp.text)
+
+        # Find the main Description for this group
+        for desc in gruppo_root.findall('.//rdf:Description', ns):
+            about = desc.get(f"{{{ns['rdf']}}}about", "")
+            if about == gruppo_uri:
+                # Try ocd:sigla first
+                sigla = desc.find('ocd:sigla', ns)
+                if sigla is not None and sigla.text:
+                    return sigla.text.strip()
+
+                # Parse abbreviation from rdfs:label
+                # Format: "FULL NAME (ABBREVIATION) (DATE"
+                label = desc.find('rdfs:label', ns)
+                if label is not None and label.text:
+                    label_text = label.text.strip()
+                    # Extract abbreviation from parentheses
+                    match = re.search(r'\(([A-Z\-]+)\)\s*\(', label_text)
+                    if match:
+                        return match.group(1)
+                    # Fallback: return full label
+                    return label_text
+    except Exception:
+        pass
+    return ""
+
+
 def build_scheda_link(resource_uri: str, legislatura: str) -> str:
     """Build scheda deputato link from resource URI."""
-    # Extract person ID from URI like http://dati.camera.it/ocd/deputato.rdf/d50204_19
-    # Format: d{personId}_{legislatura}
+    # Extract person ID from URI like:
+    # - http://dati.camera.it/ocd/deputato.rdf/d50204_19 (deputato)
+    # - http://dati.camera.it/ocd/persona.rdf/p50204 (persona)
+
+    # Try deputato format: d{personId}_{legislatura}
     match = re.search(r'/d(\d+)_\d+', resource_uri)
     if match:
         person_id = match.group(1)
         return f"https://documenti.camera.it/apps/commonServices/getDocumento.ashx?sezione=deputati&tipoDoc=schedaDeputato&idlegislatura={legislatura}&idPersona={person_id}"
+
+    # Try persona format: p{personId}
+    match = re.search(r'/p(\d+)', resource_uri)
+    if match:
+        person_id = match.group(1)
+        return f"https://documenti.camera.it/apps/commonServices/getDocumento.ashx?sezione=deputati&tipoDoc=schedaDeputato&idlegislatura={legislatura}&idPersona={person_id}"
+
     return resource_uri
 
 
@@ -464,8 +601,12 @@ def save_markdown(atti: list, vault_dir: Path) -> None:
         if atto.get("camera-firmatari"):
             lines.append("camera-firmatari:")
             for dep in atto.get("camera-firmatari", []):
-                if dep.get('link'):
-                    lines.append(f"  - \"[{dep['name']}]({dep['link']})\"")
+                if dep.get('role'):
+                    # Government bill: show ministerial role
+                    lines.append(f"  - \"{dep['name']} - {dep['role']}\"")
+                elif dep.get('group'):
+                    # Parliamentary bill: show parliamentary group
+                    lines.append(f"  - \"{dep['name']} - {dep['group']}\"")
                 else:
                     lines.append(f"  - \"{dep['name']}\"")
         if atto.get("camera-relatori"):
