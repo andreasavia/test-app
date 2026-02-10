@@ -13,7 +13,10 @@
       "Bash(xargs cat:*)",
       "Bash(xargs python -c \"import json,sys; data=json.load\\(open\\(sys.argv[1]\\)\\); [print\\(f\"\"{a[''codiceRedazionale'']}: {a[''descrizioneAtto'']}\"\"\\) for a in data[''listaAtti''] if a.get\\(''codiceRedazionale''\\) in [''26G00026'',''26G00029'']]\")",
       "WebFetch(domain:www.camera.it)",
-      "WebFetch(domain:dati.camera.it)"
+      "WebFetch(domain:dati.camera.it)",
+      "WebFetch(domain:github.com)",
+      "Bash(pip3 install:*)",
+      "WebFetch(domain:www.normattiva.it)"
     ]
   }
 }
